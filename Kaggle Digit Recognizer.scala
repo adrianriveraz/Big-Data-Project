@@ -1,69 +1,110 @@
-// Databricks notebook source
+import org.apache.spark._
+//import org.apache.spark.h2o.RDD
+import org.apache.spark.mllib.evaluation.MulticlassMetrics
+import org.apache.spark.mllib.regression.LabeledPoint
+import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.mllib.tree.RandomForest
+import org.apache.spark.mllib.tree.model.RandomForestModel
 import scala.io.Source
 
-// COMMAND ----------
+object TrainRFMLLib {
 
-type Pixels = Array[Int]
 
-// COMMAND ----------
+  def main(args: Array[String]) {
+    val conf = new SparkConf().setAppName("Kaggle - TrainRFMLLib")
+    val sc = new SparkContext(conf)
 
-case class Digit(value: Int, pixels: Pixels)
+    val binarized = sc.textFile("/FileStore/tables/train.csv")
 
-// COMMAND ----------
+    val labeled = binarized
+      .map(_.split(",").map(_.toDouble))
+      .map{values =>
+        LabeledPoint(values.head, Vectors.dense(values.tail))
+      }
 
-def classifyInput(trainingDigits: Array[Digit], input: Pixels): Int = {
-  def distance(pixels1: Pixels, pixels2: Pixels) =
-    pixels1.zip(pixels2)
-      .map(p => (p._1 - p._2) * (p._1 - p._2))
-      .sum
+    val categoricalFeaturesInfo =
+      (for(i <- 0 to 783) yield (i,2)).toMap
 
-  trainingDigits
-    .minBy(digit => distance(digit.pixels, input))
-    .value
-}
+    val foldSize = 42000 / 5
 
-// COMMAND ----------
+    val testNbTree = Seq(10, 50, 100, 200, 300, 500)
+    val testMaxDepth = Seq(5, 10, 20, 30)
 
-def readDigits(file: String): Array[Digit] = {
-  def readDigit(line: String) = {
-    val entry = line.split(',').map(_.toInt)
-    Digit(entry.head, entry.tail)
+    for {
+      nbTree <- testNbTree
+      maxDepth <- testMaxDepth
+    }  {
+
+      val scores = for (i <- 1 to 5) yield {
+        val split =
+          labeled.zipWithIndex().map {
+            case (row, idx) if idx >= (i - 1) * foldSize && idx < i * foldSize =>
+              (row, true)
+            case (row, idx) =>
+              (row, false)
+          }
+        val training = split.filter(_._2 == false).map(_._1)
+        val testing = split.filter(_._2 == true).map(_._1)
+
+        val model = RandomForest.trainClassifier(
+          input = training,
+          numClasses = 10,
+          categoricalFeaturesInfo = categoricalFeaturesInfo,
+          numTrees = nbTree,
+          featureSubsetStrategy = "auto",
+          impurity = "gini",
+          maxDepth = maxDepth,
+          maxBins = 100,
+          seed = 199)
+
+        computeAndPrintMetrics(s"nbTree=$nbTree maxDepth=$maxDepth k=$i", model, testing)
+      }
+
+      val total = scores.reduce((acc,value) => (acc._1 + value._1, acc._2 + value._2))
+      println(s"********=> nbTree=$nbTree, maxDepth=$maxDepth, meanPrecision=${total._1 / 5}, meanRecall=${total._2 / 5}")
+    }
+
   }
 
-  Source.fromFile(file)
-    .getLines
-    .drop(1)
-    .map(readDigit)
-    .toArray
-}
-
-// COMMAND ----------
-
-def printResults(): Unit = {
-  case class Pair(expected: Int, actual: Int)
-
-  val trainingDigits = readDigits("/FileStore/tables/train.csv")
-  val testDigits = readDigits("/FileStore/tables/test.csv")
-  val classify = classifyInput(trainingDigits, _)
-
-  val pairs = testDigits.map { digit =>
-    val pair = Pair(digit.value, classify(digit.pixels))
-    println(pair)
-    pair
+  private def computeAndPrintMetrics(id:String, model:RandomForestModel, testingSet:RDD[LabeledPoint]):(Double,Double) = {
+    val predictions = testingSet.map { item =>
+      (model.predict(item.features), item.label)
+    }
+    val metrics = new MulticlassMetrics(predictions)
+    println("*******************************")
+    println(s"Metrics for $id")
+    //println(metrics.confusionMatrix)
+    //println(s"f1 : ${metrics.fMeasure}")
+    val (totPrecision, totRecall) =
+      (for (label <- 0 to 9) yield (metrics.precision(label), metrics.recall(label)))
+      .reduceLeft((acc,value)=>(acc._1 + value._1, acc._2 + value._2))
+    val (meanPrecision, meanRecall) = (totPrecision/10, totRecall / 10)
+    println(s"Mean precision: $meanPrecision")
+    println(s"Mean recall: $meanRecall")
+    (meanPrecision, meanRecall)
   }
 
-  val successRate = pairs
-    .count(pair => pair.expected == pair.actual)
-    ./(pairs.length.toFloat)
-    .*(100)
 
-  println(s"Success Rate: $successRate%")
+  private def makeTestPredictions(sc:SparkContext, model:RandomForestModel):Unit = {
+    val testBinarize = sc.textFile("/FileStore/tables/train.csv")
+
+    val predictions = testBinarize
+      .zipWithIndex()
+      .map {
+        case (row, i) => (i, Vectors.dense(row.split(",").map(_.toDouble)))
+      }
+      .map{
+        case (i, features) => (i, model.predict(features))
+      }
+
+    predictions
+      .repartition(1)
+      .sortBy(_._1)
+      .map{
+        case (i, predictedClass) => s"${i+1},${predictedClass.toInt}"
+      }
+      .saveAsTextFile("/tmp/predictions_RFMLLib.csv")
+    predictions.take(100)
+  
+  }
 }
-
-// COMMAND ----------
-
-printResults()
-
-// COMMAND ----------
-
-
